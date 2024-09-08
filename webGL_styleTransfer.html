@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGL Style Transfer</title>
+    <style>
+        body, html {
+            margin: 0;
+            overflow: hidden;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #000;
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+    <script src="https://unpkg.com/ml5@0.12.2/dist/ml5.min.js"></script>
+</head>
+<body>
+    <canvas id="webgl-canvas"></canvas>
+    <script>
+        let style1, style2;
+        let resultImg1 = new Image();
+        let resultImg2 = new Image();
+        let isTransferring1 = false;
+        let isTransferring2 = false;
+        let blendFactor = 0.0;
+        let fadeDirection = 1; // 1 for fade in, -1 for fade out
+        let lastUpdateTime = 0;
+        const fadeDuration = 10000; // 10 seconds in milliseconds
+
+        let video;
+        let camWidth, camHeight;
+
+        function calculateResolution() {
+            if (camWidth && camHeight) {
+                const aspectRatio = camWidth / camHeight;
+                const maxWidth = camWidth / 8;
+                const maxHeight = maxWidth / aspectRatio;
+
+                return { width: maxWidth, height: maxHeight };
+            }
+            return { width: 640 / 1.90, height: 480 / 1.90 }; // Default resolution if dimensions are not set
+        }
+
+        function setupWebcam() {
+            const { width, height } = calculateResolution();
+
+            navigator.mediaDevices.getUserMedia({
+                video: {
+                    width: { ideal: width },
+                    height: { ideal: height }
+                }
+            }).then(stream => {
+                video = document.createElement('video');
+                video.srcObject = stream;
+                video.play();
+
+                video.addEventListener('loadedmetadata', () => {
+                    camWidth = video.videoWidth;
+                    camHeight = video.videoHeight;
+
+                    const canvas = document.getElementById('webgl-canvas');
+                    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+
+                    if (!gl) {
+                        alert('Your browser does not support WebGL');
+                        return;
+                    }
+
+                    function resizeCanvas() {
+                        const windowAspectRatio = window.innerWidth / window.innerHeight;
+                        const videoAspectRatio = camWidth / camHeight;
+
+                        let nW, nH;
+                        if (windowAspectRatio > videoAspectRatio) {
+                            nW = window.innerWidth;
+                            nH = window.innerWidth / videoAspectRatio;
+                        } else {
+                            nW = window.innerHeight * videoAspectRatio;
+                            nH = window.innerHeight;
+                        }
+
+                        canvas.width = nW;
+                        canvas.height = nH;
+                        gl.viewport(0, 0, canvas.width, canvas.height);
+                    }
+
+                    resizeCanvas();
+                    window.addEventListener('resize', resizeCanvas);
+
+                    // Vertex shader
+                    const vertexShaderSource = `
+                        attribute vec2 position;
+                        varying vec2 texCoord;
+                        void main() {
+                            texCoord = vec2(1.0 - (position.x * 0.5 + 0.5), -position.y * 0.5 + 0.5); // Flip X-axis
+                            gl_Position = vec4(position, 0.0, 1.0);
+                        }
+                    `;
+
+                    // Fragment shader: Blend between two styles
+                    const fragmentShaderSource = `
+                        precision mediump float;
+                        varying vec2 texCoord;
+                        uniform sampler2D texture1;
+                        uniform sampler2D texture2;
+                        uniform float blendFactor;
+
+                        void main() {
+                            vec4 color1 = texture2D(texture1, texCoord);
+                            vec4 color2 = texture2D(texture2, texCoord);
+                            gl_FragColor = mix(color1, color2, blendFactor);
+                        }
+                    `;
+
+                    const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+                    gl.shaderSource(vertexShader, vertexShaderSource);
+                    gl.compileShader(vertexShader);
+
+                    const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+                    gl.shaderSource(fragmentShader, fragmentShaderSource);
+                    gl.compileShader(fragmentShader);
+
+                    const program = gl.createProgram();
+                    gl.attachShader(program, vertexShader);
+                    gl.attachShader(program, fragmentShader);
+                    gl.linkProgram(program);
+                    gl.useProgram(program);
+
+                    // Set up geometry
+                    const vertices = new Float32Array([
+                        -1.0, -1.0,
+                         1.0, -1.0,
+                        -1.0,  1.0,
+                         1.0,  1.0,
+                    ]);
+
+                    const positionLocation = gl.getAttribLocation(program, 'position');
+                    const positionBuffer = gl.createBuffer();
+                    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+                    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+                    gl.enableVertexAttribArray(positionLocation);
+                    gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+                    // Create textures for style1 and style2
+                    const texture1 = gl.createTexture();
+                    const texture2 = gl.createTexture();
+                    gl.bindTexture(gl.TEXTURE_2D, texture1);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+                    gl.bindTexture(gl.TEXTURE_2D, texture2);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+                    const texture1Location = gl.getUniformLocation(program, 'texture1');
+                    const texture2Location = gl.getUniformLocation(program, 'texture2');
+                    const blendFactorLocation = gl.getUniformLocation(program, 'blendFactor');
+                    gl.uniform1i(texture1Location, 0); // Texture unit 0
+                    gl.uniform1i(texture2Location, 1); // Texture unit 1
+
+                    function loadStyleTransferModel(url, callback) {
+                        return ml5.styleTransfer(url, video, () => {
+                            callback();
+                        });
+                    }
+
+                    style1 = loadStyleTransferModel('https://raw.githubusercontent.com/northonmingorance/styletransfertest/main/test17', () => {
+                        isTransferring1 = true;
+                        console.log("Style 1 model loaded");
+                    });
+
+                    style2 = loadStyleTransferModel('https://raw.githubusercontent.com/unexpector/ml5js-Style-Gallery/master/models/comsmos1', () => {
+                        isTransferring2 = true;
+                        console.log("Style 2 model loaded");
+                    });
+
+                    function render() {
+                        const currentTime = Date.now();
+                        const elapsedTime = currentTime - lastUpdateTime;
+
+                        if (elapsedTime > fadeDuration) {
+                            lastUpdateTime = currentTime;
+                            fadeDirection *= -1; // Switch direction
+                        }
+
+                        blendFactor += (fadeDirection * (elapsedTime / fadeDuration)) / 10;
+                        blendFactor = Math.max(0.0, Math.min(1.0, blendFactor)); // Clamp between 0 and 1
+
+                        if (isTransferring1 && isTransferring2) {
+                            style1.transfer((err, img) => {
+                                if (!err) {
+                                    resultImg1.src = img.src;
+                                    gl.bindTexture(gl.TEXTURE_2D, texture1);
+                                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, resultImg1);
+                                }
+                            });
+
+                            style2.transfer((err, img) => {
+                                if (!err) {
+                                    resultImg2.src = img.src;
+                                    gl.bindTexture(gl.TEXTURE_2D, texture2);
+                                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, resultImg2);
+                                }
+                            });
+
+                            gl.clear(gl.COLOR_BUFFER_BIT);
+
+                            // Ensure correct texture binding before drawing
+                            gl.activeTexture(gl.TEXTURE0);
+                            gl.bindTexture(gl.TEXTURE_2D, texture1);
+                            gl.uniform1i(texture1Location, 0);
+
+                            gl.activeTexture(gl.TEXTURE1);
+                            gl.bindTexture(gl.TEXTURE_2D, texture2);
+                            gl.uniform1i(texture2Location, 1);
+
+                            gl.uniform1f(blendFactorLocation, blendFactor);
+
+                            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+                            requestAnimationFrame(render);
+                        } else {
+                            requestAnimationFrame(render);
+                        }
+                    }
+
+                    render();
+                });
+            }).catch(error => {
+                console.error('Error accessing webcam: ', error);
+            });
+        }
+
+        setupWebcam();
+
+        // Function to toggle fullscreen
+        function toggleFullscreen() {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch((err) => {
+                    console.log(`Error attempting to enable fullscreen mode: ${err.message} (${err.name})`);
+                });
+            } else {
+                document.exitFullscreen();
+            }
+        }
+
+        // Add event listener to toggle fullscreen on click
+        document.body.addEventListener('click', toggleFullscreen);
+
+    </script>
+</body>
+</html>
