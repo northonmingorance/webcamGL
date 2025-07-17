@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGL Webcam Ripple Effect</title>
+    <style>
+        body, html {
+            margin: 0;
+            overflow: hidden;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #000;
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+
+<canvas id="webgl-canvas"></canvas>
+
+<script>
+// Access the webcam
+navigator.mediaDevices.getUserMedia({ video: true })
+    .then(stream => {
+        const video = document.createElement('video');
+        video.srcObject = stream;
+        video.setAttribute('playsinline', ''); // Important for iOS
+        video.play();
+
+        video.addEventListener('loadedmetadata', () => {
+            const canvas = document.getElementById('webgl-canvas');
+            const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+
+            if (!gl) {
+                alert('Your browser does not support WebGL. Please try a different browser.');
+                return;
+            }
+
+            const vertexShaderSource = `
+                attribute vec2 a_position;
+                varying vec2 v_texCoord;
+                void main() {
+                    // Flip the video feed horizontally
+                    v_texCoord = vec2(1.0 - (a_position.x * 0.5 + 0.5), 1.0 - (a_position.y * 0.5 + 0.5));
+                    gl_Position = vec4(a_position, 0.0, 1.0);
+                }
+            `;
+
+            const fragmentShaderSource = `
+                precision mediump float;
+                varying vec2 v_texCoord;
+                uniform sampler2D u_videoTexture;
+                uniform float u_time;
+                uniform vec2 u_resolution;
+                uniform vec3 u_ripples[10];
+                uniform int u_rippleCount;
+
+                void main() {
+                    vec2 texCoord = v_texCoord;
+                    // Invert v_texCoord for calculations to match ripple coordinate system
+                    vec2 calculationCoord = vec2(1.0 - v_texCoord.x, v_texCoord.y);
+                    vec2 pixelCoord = calculationCoord * u_resolution;
+
+                    for (int i = 0; i < 10; i++) {
+                        if (i >= u_rippleCount) break;
+
+                        vec3 ripple = u_ripples[i];
+                        float rippleAge = u_time - ripple.z;
+                        vec2 diff = pixelCoord - (ripple.xy * u_resolution);
+                        float dist = length(diff / u_resolution.y);
+                        float radius = (rippleAge * 250.0) / u_resolution.y;
+                        float thickness = 40.0 / u_resolution.y;
+
+                        if (dist > radius - thickness && dist < radius) {
+                            float rippleFactor = sin((dist - (radius - thickness)) / thickness * 3.14159);
+                            vec2 displacementDirection = normalize(diff);
+                            texCoord -= displacementDirection * rippleFactor * 0.05;
+                        }
+                    }
+                    gl_FragColor = texture2D(u_videoTexture, texCoord);
+                }
+            `;
+
+            function createShader(gl, type, source) {
+                const shader = gl.createShader(type);
+                gl.shaderSource(shader, source);
+                gl.compileShader(shader);
+                if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                    console.error('An error occurred compiling the shaders: ' + gl.getShaderInfoLog(shader));
+                    gl.deleteShader(shader);
+                    return null;
+                }
+                return shader;
+            }
+
+            const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+            const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+
+            function createProgram(gl, vertexShader, fragmentShader) {
+                const program = gl.createProgram();
+                gl.attachShader(program, vertexShader);
+                gl.attachShader(program, fragmentShader);
+                gl.linkProgram(program);
+                if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                    console.error('Unable to initialize the shader program: ' + gl.getProgramInfoLog(program));
+                    return null;
+                }
+                return program;
+            }
+
+            const program = createProgram(gl, vertexShader, fragmentShader);
+            gl.useProgram(program);
+
+            const positionBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            const positions = [-1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0];
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+
+            const positionAttributeLocation = gl.getAttribLocation(program, "a_position");
+            gl.enableVertexAttribArray(positionAttributeLocation);
+            gl.vertexAttribPointer(positionAttributeLocation, 2, gl.FLOAT, false, 0, 0);
+
+            const videoTexture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+            const resolutionUniformLocation = gl.getUniformLocation(program, "u_resolution");
+            const timeUniformLocation = gl.getUniformLocation(program, "u_time");
+            const videoTextureUniformLocation = gl.getUniformLocation(program, "u_videoTexture");
+            const ripplesUniformLocation = gl.getUniformLocation(program, "u_ripples");
+            const rippleCountUniformLocation = gl.getUniformLocation(program, "u_rippleCount");
+
+            let ripples = [];
+            const MAX_RIPPLES = 10;
+
+            function addRipple(x, y) {
+                if (ripples.length >= MAX_RIPPLES) {
+                    ripples.shift();
+                }
+                ripples.push({ x, y, startTime: performance.now() / 1000.0 });
+            }
+
+            canvas.addEventListener('click', (event) => {
+                const rect = canvas.getBoundingClientRect();
+                const x = (event.clientX - rect.left) / rect.width;
+                const y = (event.clientY - rect.top) / rect.height;
+                addRipple(x, y);
+            });
+
+            setInterval(() => {
+                addRipple(Math.random(), Math.random());
+            }, 1000);
+
+            function render(time) {
+                time *= 0.001;
+
+                const videoAspectRatio = video.videoWidth / video.videoHeight;
+                const windowAspectRatio = window.innerWidth / window.innerHeight;
+
+                if (windowAspectRatio > videoAspectRatio) {
+                    canvas.width = window.innerWidth;
+                    canvas.height = window.innerWidth / videoAspectRatio;
+                } else {
+                    canvas.height = window.innerHeight;
+                    canvas.width = window.innerHeight * videoAspectRatio;
+                }
+
+                gl.viewport(0, 0, canvas.width, canvas.height);
+
+                gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+
+                gl.uniform2f(resolutionUniformLocation, canvas.width, canvas.height);
+                gl.uniform1f(timeUniformLocation, time);
+                gl.uniform1i(videoTextureUniformLocation, 0);
+
+                const currentTime = time;
+                ripples = ripples.filter(r => (currentTime - r.startTime) * 250.0 < Math.max(gl.canvas.width, gl.canvas.height) * 1.5);
+
+                let rippleData = [];
+                for (let i = 0; i < ripples.length; i++) {
+                    rippleData.push(ripples[i].x, ripples[i].y, ripples[i].startTime);
+                }
+                while (rippleData.length < MAX_RIPPLES * 3) {
+                    rippleData.push(0, 0, 0);
+                }
+
+                gl.uniform3fv(ripplesUniformLocation, rippleData);
+                gl.uniform1i(rippleCountUniformLocation, ripples.length);
+
+                gl.clearColor(0, 0, 0, 0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+                requestAnimationFrame(render);
+            }
+
+            requestAnimationFrame(render);
+        });
+    })
+    .catch(err => {
+        console.error("Error accessing webcam: ", err);
+        alert("Could not access the webcam. Please ensure you have a webcam enabled and have granted permission.");
+    });
+</script>
+
+</body>
+</html>
